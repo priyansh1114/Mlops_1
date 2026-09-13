@@ -1,0 +1,183 @@
+Birla Institute of Technology & Science, Pilani
+Work Integrated Learning Programmes Division
+AIML* ZG523  ·  MLOps
+Lab Experiment 3
+Deploy and Serve the ML Model as a Microservice
+Module / Session
+M3  ·  Contact Session 7
+Mapped Outcomes
+LO2  (CO2)
+Builds on
+Lab 1 (registry with @champion); Lab 2 optional but recommended
+Mode
+Self-paced, fully offline after one pip install
+Estimated Effort
+2.5 hours
+Readings
+T2 Ch. 7 (batch vs online prediction, prediction service)
+
+
+1.  Lab Storyline — From Weekly Batch to “Right Now”
+Your batch scorer ships every Monday. But CartVista's app team is building a new checkout screen: when a customer who looks likely to churn opens their cart, the app should show a personalised free-delivery offer — at that moment, not next Monday. They ask you a new kind of question: “Can we POST a customer's features and get a churn score back in under 100 milliseconds?”
+Batch and online prediction are different products with the same model inside. Today you wrap the champion in a REST microservice: a small FastAPI application with a typed contract, a health endpoint the platform team can probe, and an identity endpoint that tells everyone exactly which model version answered. Then you measure whether it really is fast enough.
+Continuity:  The service loads models:/cartvista-churn@champion — the same alias your Lab 1 consumer used. Retrain and re-point the alias, restart the service, and the app team notices nothing except better predictions. In Lab 4, this exact service gets monitoring bolted on.
+2.  Objective
+To expose the CartVista churn model as an online prediction microservice using FastAPI: a validated /predict endpoint (single and batch), a /health probe, and a /model-info identity endpoint — and to measure its latency profile under a simple load.
+3.  Learning Outcomes (Summarized)
+Contrast batch and online prediction and identify which each business request needs.
+Build a typed REST prediction service with request validation and meaningful error responses.
+Load a model by registry alias at startup — decoupling deployment of the service from selection of the model.
+Measure p50/p95/p99 latency and explain why the tail, not the average, is what SLOs are written on.
+4.  Prerequisites
+  terminal  (inside cartvista-mlops, venv active)
+pip install fastapi "uvicorn[standard]" requests
+That is all. The service reads your existing mlflow.db; no Docker required today (containerizing it is exercise E4).
+
+
+5.  Step-by-Step Instructions
+Step 1 — The service
+  serve_churn.py
+"""CartVista churn scoring microservice (FastAPI + MLflow registry)."""
+import time
+import mlflow, mlflow.pyfunc, pandas as pd
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from mlflow import MlflowClient
+ 
+TRACKING_URI = "sqlite:///mlflow.db"
+MODEL_NAME, ALIAS = "cartvista-churn", "champion"
+ 
+app = FastAPI(title="CartVista Churn Service", version="1.0")
+ 
+# ---- typed request contract: the API *is* this class ----
+class Customer(BaseModel):
+    tenure_months:    int   = Field(ge=0, le=120)
+    monthly_spend:    float = Field(ge=0)
+    orders_per_month: int   = Field(ge=0)
+    support_tickets:  int   = Field(ge=0)
+    uses_discounts:   int   = Field(ge=0, le=1)
+    app_sessions:     int   = Field(ge=0)
+ 
+class BatchRequest(BaseModel):
+    customers: list[Customer]
+ 
+state = {}
+ 
+@app.on_event("startup")
+def load_model():
+    mlflow.set_tracking_uri(TRACKING_URI)
+    state["model"] = mlflow.pyfunc.load_model(
+        f"models:/{MODEL_NAME}@{ALIAS}")
+    mv = MlflowClient().get_model_version_by_alias(MODEL_NAME, ALIAS)
+    state["version"], state["run_id"] = mv.version, mv.run_id
+    print(f"Loaded {MODEL_NAME} v{mv.version} (run {mv.run_id[:8]})")
+ 
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": "model" in state}
+ 
+@app.get("/model-info")
+def model_info():
+    return {"model": MODEL_NAME, "alias": ALIAS,
+            "version": state["version"], "run_id": state["run_id"]}
+ 
+@app.post("/predict")
+def predict(customer: Customer):
+    t0 = time.perf_counter()
+    df = pd.DataFrame([customer.model_dump()])
+    pred = int(state["model"].predict(df)[0])
+    ms = (time.perf_counter() - t0) * 1000
+    return {"churn_prediction": pred,
+            "model_version": state["version"],
+            "inference_ms": round(ms, 2)}
+ 
+@app.post("/predict-batch")
+def predict_batch(batch: BatchRequest):
+    if not batch.customers:
+        raise HTTPException(422, "empty batch")
+    df = pd.DataFrame([c.model_dump() for c in batch.customers])
+    preds = state["model"].predict(df)
+    return {"predictions": [int(p) for p in preds],
+            "count": len(preds), "model_version": state["version"]}
+Step 2 — Run it and read the automatic docs
+  terminal
+uvicorn serve_churn:app --port 8000
+INFO:     Started server process [12345]
+Loaded cartvista-churn v2 (run ab6602cd)
+INFO:     Uvicorn running on http://127.0.0.1:8000
+Open http://127.0.0.1:8000/docs — FastAPI generated interactive API documentation from your type hints. This page is the contract you hand the app team; nobody writes it by hand. Try /health from there.
+Step 3 — Call it like the app team will
+  terminal (second window)
+curl -s -X POST http://127.0.0.1:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"tenure_months": 2, "monthly_spend": 2500, "orders_per_month": 1,
+       "support_tickets": 6, "uses_discounts": 0, "app_sessions": 2}'
+{"churn_prediction":1,"model_version":"2","inference_ms":4.87}
+Expected outcome: this at-risk profile (new, low-engagement, many tickets) predicts 1. Now send a loyal profile — 60 months tenure, 8 orders/month, 0 tickets, discounts=1 — and confirm it predicts 0.
+Step 4 — Watch validation guard the door
+  terminal
+curl -s -X POST http://127.0.0.1:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"tenure_months": -5, "monthly_spend": 2500, "orders_per_month": 1,
+       "support_tickets": 6, "uses_discounts": 0, "app_sessions": 2}'
+{"detail":[{"type":"greater_than_equal","loc":["body","tenure_months"],
+ "msg":"Input should be greater than or equal to 0","input":-5, ...}]}
+Expected outcome: HTTP 422 with a precise, machine-readable reason — the model never saw the bad row. Garbage rejected at the boundary is the cheapest bug you will ever fix.
+Step 5 — Measure the latency profile
+  load_test.py
+"""Tiny load test: 300 requests, report the percentiles that matter."""
+import time, statistics, requests
+ 
+URL = "http://127.0.0.1:8000/predict"
+PAYLOAD = {"tenure_months": 24, "monthly_spend": 1500.0,
+           "orders_per_month": 3, "support_tickets": 1,
+           "uses_discounts": 1, "app_sessions": 10}
+ 
+lat = []
+for _ in range(300):
+    t0 = time.perf_counter()
+    r = requests.post(URL, json=PAYLOAD, timeout=5)
+    r.raise_for_status()
+    lat.append((time.perf_counter() - t0) * 1000)
+ 
+lat.sort()
+q = lambda p: lat[int(p / 100 * len(lat)) - 1]
+print(f"n={len(lat)}  p50={q(50):.1f}ms  p95={q(95):.1f}ms  "
+      f"p99={q(99):.1f}ms  max={max(lat):.1f}ms")
+  terminal
+python load_test.py
+n=300  p50=6.2ms  p95=11.8ms  p99=19.4ms  max=42.1ms
+Expected outcome: p50 well under the 100 ms budget; absolute numbers vary by machine. Note the gap between p50 and max — a 7× spread on identical requests. The app team's SLO must be written on p95/p99, because 1 in 20 customers lives in that tail.
+
+
+6.  Exercises
+E1 — Probability, not verdict  (15 min)
+The retention team wants to rank customers, not just flag them. Add churn_probability to /predict using predict_proba (hint: load with mlflow.sklearn.load_model instead of pyfunc to expose it). Show one response for the at-risk and one for the loyal profile.
+E2 — Batch economics  (15 min)
+Extend load_test.py to also time /predict-batch with 100 customers per call. Compare total time for 300 customers via 300 single calls vs 3 batch calls. Explain the difference in one paragraph — where did the time go?
+E3 — Champion hot-swap  (15 min)
+With the service running, re-run Lab 1's register_model.py so @champion moves (or move the alias in the UI). Does /model-info change? Restart the service and check again. State precisely when the alias is resolved, and one risk of this design.
+E4 — Containerize the service  (20 min)
+Write a Dockerfile for serve_churn.py (Lab 2 skills; CMD uses uvicorn --host 0.0.0.0). Mind the trap: the container needs the model. Either mount mlflow.db + mlruns as volumes, or bake the exported model in and bypass the registry. Choose one, run with -p 8000:8000, and defend your choice in three sentences.
+E5 (stretch) — Graceful degradation  (15 min)
+Make startup survive a missing registry: if loading fails, /health returns {"status": "degraded", "model_loaded": false} and /predict returns HTTP 503 instead of crashing the process. Prove it by renaming mlflow.db, starting, probing, restoring.
+7.  Troubleshooting
+Symptom
+Fix
+RESOURCE_DOES_NOT_EXIST on startup
+Start uvicorn from the cartvista-mlops folder (relative sqlite path), and confirm the @champion alias exists in the Models tab.
+Port 8000 in use
+uvicorn serve_churn:app --port 8001 (update URLs accordingly).
+curl JSON errors on Windows
+PowerShell mangles single quotes. Use  Invoke-RestMethod  or run curl in Git Bash / WSL; or use the /docs page's Try-it-out instead.
+Predictions differ from Lab 1
+Check /model-info — if @champion moved (e.g. after Lab 2's DAG ran), you are legitimately serving a newer version.
+First request slow (100+ ms), rest fast
+Normal — lazy imports and CPU cache warm-up. This is why load tests discard a warm-up phase; try it in E2.
+8.  Deliverables Checklist (for EC-1 Lab Assignment)
+Screenshot: the /docs page showing all four endpoints.
+Terminal output: the at-risk and loyal /predict calls, and the 422 validation rejection.
+load_test.py percentile line, plus E2's single-vs-batch comparison and explanation.
+E1 probability responses; E3 written answer on alias resolution timing.
+Reflection: “The service is fast and correct today. List two ways it could quietly become wrong next month without a single error appearing in its logs.” — bring this answer to Session 8; it is the opening question of Lab 4.
+Academic integrity:  inference_ms values, run IDs in /model-info, and your machine's latency profile are unique fingerprints and are checked.
